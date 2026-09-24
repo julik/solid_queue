@@ -6,8 +6,14 @@ module SolidQueue
       after_boot :fail_orphaned_executions
     end
 
+    # How far past its own interval a maintenance run is allowed to go before we
+    # treat it as stalled rather than slow. One full missed cycle of slack.
+    STALL_FACTOR = 2
+
     private
       def launch_maintenance_task
+        @last_maintenance_returned_at = Concurrent::AtomicReference.new(SolidQueue::Timer.monotonic_time_now)
+
         @maintenance_task = Concurrent::TimerTask.new(run_now: true, execution_interval: SolidQueue.process_alive_threshold) do
           prune_dead_processes
         end
@@ -17,14 +23,77 @@ module SolidQueue
         end
 
         @maintenance_task.execute
+
+        launch_maintenance_watchdog
+      end
+
+      # Pruning is how a supervisor notices dead processes, and it runs in a
+      # Concurrent::TimerTask, which reschedules only once its task returns. A
+      # prune blocked on an unresponsive database therefore stops this supervisor
+      # pruning ever again, silently -- the mechanism meant to notice dead
+      # processes is built from the same material as the processes it watches.
+      #
+      # A supervisor cannot replace itself, so stop instead, and leave it to
+      # whatever runs this supervisor to start a new one.
+      #
+      # The watchdog ticks at the heartbeat interval - not that heartbeats are
+      # involved, but any working configuration already keeps that cadence well
+      # inside the alive threshold, so a stall is noticed at most one tick
+      # after it crosses the line.
+      def launch_maintenance_watchdog
+        @maintenance_watchdog_task = Concurrent::TimerTask.new(execution_interval: SolidQueue.process_heartbeat_interval) do
+          stop_stalled_supervisor if maintenance_stalled?
+        end
+
+        @maintenance_watchdog_task.add_observer do |_, _, error|
+          handle_thread_error(error) if error
+        end
+
+        @maintenance_watchdog_task.execute
       end
 
       def stop_maintenance_task
         @maintenance_task&.shutdown
+        @maintenance_watchdog_task&.shutdown
+      end
+
+      # Whether maintenance has stopped returning altogether, as opposed to
+      # failing: a prune that raises is reported by the task's observer.
+      def maintenance_stalled?
+        SolidQueue::Timer.monotonic_time_now - @last_maintenance_returned_at.get >
+          STALL_FACTOR * SolidQueue.process_alive_threshold
+      end
+
+      # The database is presumed unresponsive, so the way out must not depend
+      # on it. Dropping the registration locally first makes shutdown's
+      # deregister callback a no-op instead of a round-trip that would block
+      # exactly like the prune did; the stale row is left for another
+      # supervisor to prune.
+      #
+      # A standalone supervisor stops through the signal pipeline, so that
+      # handle_signal pairs stop with terminate_gracefully on the supervise
+      # thread: a bare stop would exit without ever signalling the forks, whose
+      # only other way of noticing is polling their parent pid once per run
+      # loop iteration. An embedded supervisor never drains its signal queue,
+      # but it already terminates its threads from an after_shutdown hook, so a
+      # plain stop is enough there.
+      def stop_stalled_supervisor
+        return if stopped?
+
+        self.process = nil
+
+        if standalone?
+          signal_queue << :TERM
+          interrupt
+        else
+          stop
+        end
       end
 
       def prune_dead_processes
         wrap_in_app_executor { SolidQueue::Process.prune(excluding: process) }
+      ensure
+        @last_maintenance_returned_at.set(SolidQueue::Timer.monotonic_time_now)
       end
 
       def fail_orphaned_executions

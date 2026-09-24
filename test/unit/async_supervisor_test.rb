@@ -15,6 +15,92 @@ class AsyncSupervisorTest < ActiveSupport::TestCase
     assert_no_registered_processes
   end
 
+  test "stop when maintenance stops returning for longer than the stall threshold" do
+    # The heartbeat interval must sit well below the alive threshold: a healthy
+    # gap between heartbeat returns is already one interval plus a database
+    # round-trip, so equal settings would make the heartbeat watchdog replace
+    # perfectly healthy children mid-test
+    old_alive_threshold, SolidQueue.process_alive_threshold = SolidQueue.process_alive_threshold, 0.3.seconds
+    old_heartbeat_interval, SolidQueue.process_heartbeat_interval = SolidQueue.process_heartbeat_interval, 0.1.seconds
+
+    # A prune that never returns, so the maintenance TimerTask is never
+    # rescheduled and this supervisor would silently stop pruning forever
+    unblock_prunes = Concurrent::Event.new
+    SolidQueue::Supervisor::Maintenance.module_eval do
+      alias_method :prune_dead_processes_without_blocking, :prune_dead_processes
+      define_method(:prune_dead_processes) { unblock_prunes.wait }
+    end
+
+    supervisor = run_supervisor_as_thread
+    wait_while_with_timeout(5) { !supervisor.send(:stopped?) }
+
+    assert supervisor.send(:stopped?)
+
+    # The children deregister on the way down; the supervisor's own row cannot
+    # be removed -- the prune is what is wedged -- and stays for another
+    # supervisor to prune
+    wait_for_registered_processes(1, timeout: 3.seconds)
+    assert_registered_processes(kind: "Supervisor(async)")
+  ensure
+    unblock_prunes.set
+    SolidQueue::Supervisor::Maintenance.module_eval do
+      if private_method_defined?(:prune_dead_processes_without_blocking)
+        remove_method :prune_dead_processes
+        alias_method :prune_dead_processes, :prune_dead_processes_without_blocking
+        remove_method :prune_dead_processes_without_blocking
+      end
+    end
+    SolidQueue.process_alive_threshold = old_alive_threshold if old_alive_threshold
+    SolidQueue.process_heartbeat_interval = old_heartbeat_interval if old_heartbeat_interval
+    supervisor&.stop
+  end
+
+  test "complete shutdown when maintenance stalls and the database is unresponsive" do
+    old_alive_threshold, SolidQueue.process_alive_threshold = SolidQueue.process_alive_threshold, 0.3.seconds
+    old_heartbeat_interval, SolidQueue.process_heartbeat_interval = SolidQueue.process_heartbeat_interval, 0.1.seconds
+
+    # The same unresponsive database that wedges the prune wedges the
+    # deregister on the way out, so shutdown must not attempt it: a supervisor
+    # that detects the stall but blocks in its own shutdown never lets whatever
+    # runs it start a replacement
+    unblock_stalled_calls = Concurrent::Event.new
+    SolidQueue::Supervisor::Maintenance.module_eval do
+      alias_method :prune_dead_processes_without_blocking, :prune_dead_processes
+      define_method(:prune_dead_processes) { unblock_stalled_calls.wait }
+    end
+    SolidQueue::Process.class_eval do
+      alias_method :deregister_without_blocking, :deregister
+      define_method(:deregister) do |pruned: false|
+        kind.start_with?("Supervisor") ? unblock_stalled_calls.wait : deregister_without_blocking(pruned: pruned)
+      end
+    end
+
+    supervisor = run_supervisor_as_thread
+    supervise_thread = supervisor.instance_variable_get(:@thread)
+    wait_while_with_timeout(5) { supervise_thread.alive? }
+
+    assert_not supervise_thread.alive?
+  ensure
+    unblock_stalled_calls.set
+    SolidQueue::Supervisor::Maintenance.module_eval do
+      if private_method_defined?(:prune_dead_processes_without_blocking)
+        remove_method :prune_dead_processes
+        alias_method :prune_dead_processes, :prune_dead_processes_without_blocking
+        remove_method :prune_dead_processes_without_blocking
+      end
+    end
+    SolidQueue::Process.class_eval do
+      if method_defined?(:deregister_without_blocking)
+        remove_method :deregister
+        alias_method :deregister, :deregister_without_blocking
+        remove_method :deregister_without_blocking
+      end
+    end
+    SolidQueue.process_alive_threshold = old_alive_threshold if old_alive_threshold
+    SolidQueue.process_heartbeat_interval = old_heartbeat_interval if old_heartbeat_interval
+    supervisor&.stop
+  end
+
   test "start standalone" do
     pid = run_supervisor_as_fork(mode: :async)
     wait_for_registered_processes(4, timeout: 5.seconds) # supervisor + dispatcher + 2 workers
