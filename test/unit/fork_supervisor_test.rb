@@ -273,6 +273,25 @@ class ForkSupervisorTest < ActiveSupport::TestCase
     assert_equal "RuntimeError", failed.exception_class
   end
 
+  test "terminate forks when the supervisor's registration is pruned" do
+    old_heartbeat_interval, SolidQueue.process_heartbeat_interval = SolidQueue.process_heartbeat_interval, 0.1.seconds
+
+    pid = run_supervisor_as_fork
+    wait_for_registered_processes(4, timeout: 3.seconds)
+
+    # Simulate another supervisor pruning this one's registration
+    find_processes_registered_as("Supervisor(fork)").first.delete
+
+    # The next heartbeat finds the registration gone; the supervisor must stop
+    # through its signal pipeline, so its forks are terminated, not abandoned
+    wait_for_process_termination_with_timeout(pid, timeout: 5)
+
+    assert_no_registered_processes
+  ensure
+    SolidQueue.process_heartbeat_interval = old_heartbeat_interval if old_heartbeat_interval
+    terminate_process(pid) if pid && process_exists?(pid)
+  end
+
   test "terminate forks when maintenance stalls instead of abandoning them" do
     old_alive_threshold, SolidQueue.process_alive_threshold = SolidQueue.process_alive_threshold, 0.3.seconds
     old_heartbeat_interval, SolidQueue.process_heartbeat_interval = SolidQueue.process_heartbeat_interval, 0.1.seconds

@@ -42,7 +42,7 @@ module SolidQueue
       # after it crosses the line.
       def launch_maintenance_watchdog
         @maintenance_watchdog_task = Concurrent::TimerTask.new(execution_interval: SolidQueue.process_heartbeat_interval) do
-          stop_stalled_supervisor if maintenance_stalled?
+          stop_to_be_replaced if maintenance_stalled?
         end
 
         @maintenance_watchdog_task.add_observer do |_, _, error|
@@ -62,32 +62,6 @@ module SolidQueue
       def maintenance_stalled?
         SolidQueue::Timer.monotonic_time_now - @last_maintenance_returned_at.get >
           STALL_FACTOR * SolidQueue.process_alive_threshold
-      end
-
-      # The database is presumed unresponsive, so the way out must not depend
-      # on it. Dropping the registration locally first makes shutdown's
-      # deregister callback a no-op instead of a round-trip that would block
-      # exactly like the prune did; the stale row is left for another
-      # supervisor to prune.
-      #
-      # A standalone supervisor stops through the signal pipeline, so that
-      # handle_signal pairs stop with terminate_gracefully on the supervise
-      # thread: a bare stop would exit without ever signalling the forks, whose
-      # only other way of noticing is polling their parent pid once per run
-      # loop iteration. An embedded supervisor never drains its signal queue,
-      # but it already terminates its threads from an after_shutdown hook, so a
-      # plain stop is enough there.
-      def stop_stalled_supervisor
-        return if stopped?
-
-        self.process = nil
-
-        if standalone?
-          signal_queue << :TERM
-          interrupt
-        else
-          stop
-        end
       end
 
       def prune_dead_processes
